@@ -43,10 +43,8 @@ def load_api_key() -> str:
                 k, v = line.split("=", 1)
                 if k.strip() == "ELEVENLABS_API_KEY":
                     return v.strip().strip('"').strip("'")
-    v = os.environ.get("ELEVENLABS_API_KEY", "")
-    if not v:
-        sys.exit("ELEVENLABS_API_KEY not found in .env or environment")
-    return v
+    # No key -> "" and transcribe_one falls back to local faster-whisper ($0).
+    return os.environ.get("ELEVENLABS_API_KEY", "")
 
 
 def count_audio_tracks(video_path: Path) -> int:
@@ -113,6 +111,43 @@ def call_scribe(
     return resp.json()
 
 
+def call_whisper(audio_path: Path, language: str | None = None) -> dict:
+    """Free local fallback: faster-whisper, returned in Scribe's response shape.
+
+    ponytail: no diarization (speaker_id is None) and no audio-event tags;
+    add the ElevenLabs key when multi-speaker labels matter.
+    """
+    from faster_whisper import WhisperModel
+
+    model_name = os.environ.get("VIDEO_USE_WHISPER_MODEL", "small")
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    # extract_audio already wrote 16kHz mono s16 wav; hand samples over directly
+    # so faster-whisper never touches PyAV (version clash on Py3.14).
+    import numpy as np
+    with wave.open(str(audio_path), "rb") as wf:
+        samples = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+    audio = samples.astype(np.float32) / 32768.0
+    segments, info = model.transcribe(audio, language=language, word_timestamps=True)
+    words: list[dict] = []
+    for seg in segments:
+        for w in seg.words or []:
+            text = w.word.strip()
+            if not text:
+                continue
+            if words:
+                words.append({"text": " ", "start": words[-1]["end"], "end": w.start,
+                              "type": "spacing", "speaker_id": None})
+            words.append({"text": text, "start": w.start, "end": w.end,
+                          "type": "word", "speaker_id": None, "logprob": w.probability})
+    return {
+        "language_code": info.language,
+        "language_probability": info.language_probability,
+        "text": "".join(w["text"] for w in words),
+        "words": words,
+        "engine": f"faster-whisper:{model_name}",
+    }
+
+
 def transcript_path(edit_dir: Path, video: Path, audio_track: int = 0) -> Path:
     """Where a video's transcript lands.
 
@@ -173,9 +208,14 @@ def transcribe_one(
             )
 
         size_mb = audio.stat().st_size / (1024 * 1024)
-        if verbose:
-            print(f"  uploading {video.stem}.wav ({size_mb:.1f} MB)", flush=True)
-        payload = call_scribe(audio, api_key, language, num_speakers)
+        if not api_key:
+            if verbose:
+                print(f"  no ELEVENLABS_API_KEY - transcribing locally with faster-whisper", flush=True)
+            payload = call_whisper(audio, language)
+        else:
+            if verbose:
+                print(f"  uploading {video.stem}.wav ({size_mb:.1f} MB)", flush=True)
+            payload = call_scribe(audio, api_key, language, num_speakers)
 
     out_path.write_text(json.dumps(payload, indent=2))
     dt = time.time() - t0
